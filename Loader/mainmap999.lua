@@ -1,455 +1,334 @@
--- mainmap926.lua
--- Versi: full UI preserved + multiple routers via GitHub raw JSON
--- Fitur utama:
---  - records default dihapus
---  - PathLinks: daftar raw JSON (name + url)
---  - Start = mulai dari checkpoint terdekat terhadap posisi player
---  - Start to End = play semua router berurutan (dari current router)
---  - Stop = hentikan segera
---  - Next / Prev untuk pindah router dan langsung play
---  - UI ada tombol Discord (buka link), list router, dan kontrol
+-- WataX Replay (JSON loader + preserve original UI)
+-- Full version: UI from mainmap926.lua left intact, but routes are loaded from JSON (GitHub raw).
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
-local GuiService = game:GetService("GuiService")
 local player = Players.LocalPlayer
+local hrp = nil
 
--- tunggu character & hrp
-local char = player.Character or player.CharacterAdded:Wait()
-local hrp = char:WaitForChild("HumanoidRootPart")
+local function refreshHRP(char)
+    if not char then
+        char = player.Character or player.CharacterAdded:Wait()
+    end
+    hrp = char:WaitForChild("HumanoidRootPart")
+end
+if player.Character then refreshHRP(player.Character) end
+player.CharacterAdded:Connect(refreshHRP)
 
--- ===========================
--- CONFIG: edit manual PathLinks
--- masukkan link raw github JSON kalian di sini
--- contoh format file JSON: [{"pos":[x,y,z],"rot":[rx,ry,rz]}, ...]
-local PathLinks = {
-    { name = "Router 1 - Ravika", url = "https://raw.githubusercontent.com/WataXScript/WataXMountRavika/Loader/ravika.json" },
-    -- contoh tambahan:
-    -- { name = "Router 2 - test", url = "https://raw.githubusercontent.com/username/Loader/branch/replay2.json" },
-    -- { name = "Router 3 - etc", url = "https://raw.githubusercontent.com/username/Loader/branch/replay3.json" },
+local frameTime = 1/30
+local playbackRate = 1.0
+local isRunning = false
+local routes = {}
+
+-- ==================== CONFIG: ganti URL di bawah sesuai repo kamu ====================
+-- Format: ["Label"] = "https://raw.githubusercontent.com/username/repo/branch/filename.json"
+-- Contoh: ["CP0 → CP1"] = "https://raw.githubusercontent.com/me/replays/main/cp0to1.json"
+local routeLinks = {
+    -- contohnya satu route: bisa diganti
+    ["CP0 → CP1"] = "https://raw.githubusercontent.com/WataXScript/WataXMountRavika/main/Loader/ravika.json",
+    -- tambahin baris lain kalau mau banyak route
+    -- ["CP1 → CP2"] = "https://raw.githubusercontent.com/username/repo/branch/cp1to2.json",
 }
--- ===========================
+-- ====================================================================================
 
--- internal state
-local records = {}            -- akan diisi tiap load dari github
-local isPlaying = false       -- true saat sedang memutar frame dalam satu router
-local isAutoPlaying = false   -- true saat Play All (Start to End) berjalan
-local currentRouterIndex = 1  -- router yang aktif (index di PathLinks)
-
--- util: safe http load and json decode
-local function LoadFromGitHub(url)
-    if not url or url == "" then
-        warn("[Replay] LoadFromGitHub: url kosong")
-        return {}
-    end
+-- Helper: fetch & decode JSON safely
+local function fetchJson(url)
+    if not url or url == "" then return nil, "no url" end
     local ok, res = pcall(function()
-        -- HttpGet bisa error jika tidak diizinkan
-        local response = game:HttpGet(url)
-        -- decode
-        local decoded = HttpService:JSONDecode(response)
-        return decoded
-    end)
-    if not ok then
-        warn("[Replay] Gagal ambil/parse JSON:", res)
-        return {}
-    end
-    if type(res) ~= "table" then
-        warn("[Replay] JSON bukan array/table.")
-        return {}
-    end
-    return res
-end
-
--- util: convert pos array [x,y,z] ke Vector3 (aman)
-local function toVector3(posArr)
-    if not posArr or type(posArr) ~= "table" then return nil end
-    local x = tonumber(posArr[1]) or tonumber(posArr.x) or 0
-    local y = tonumber(posArr[2]) or tonumber(posArr.y) or 0
-    local z = tonumber(posArr[3]) or tonumber(posArr.z) or 0
-    return Vector3.new(x, y, z)
-end
-
--- cari index checkpoint terdekat di dalam `tbl` terhadap posisi `v3`
-local function findNearestIndex(tbl, v3)
-    if not tbl or #tbl == 0 then return 1 end
-    local bestIdx = 1
-    local bestDist = math.huge
-    for i, step in ipairs(tbl) do
-        local p = toVector3(step.pos)
-        if p then
-            local d = (p - v3).Magnitude
-            if d < bestDist then
-                bestDist = d
-                bestIdx = i
-            end
-        end
-    end
-    return bestIdx
-end
-
--- play records from given start index (synchronous)
-local function playRecordsFrom(tbl, startIndex)
-    if not tbl or #tbl == 0 then return end
-    isPlaying = true
-    for i = startIndex, #tbl do
-        if not isPlaying then break end
-        local step = tbl[i]
-        if step and step.pos then
-            local p = toVector3(step.pos)
-            if p then
-                if step.rot and type(step.rot) == "table" then
-                    -- rot likely in radians? JSON from earlier looked like radians; use as-is
-                    local rx = tonumber(step.rot[1]) or tonumber(step.rot.x) or 0
-                    local ry = tonumber(step.rot[2]) or tonumber(step.rot.y) or 0
-                    local rz = tonumber(step.rot[3]) or tonumber(step.rot.z) or 0
-                    -- set CFrame: position + rotation
-                    -- using CFrame.Angles expects radians, assuming JSON uses radian (as file suggests)
-                    hrp.CFrame = CFrame.new(p) * CFrame.Angles(rx, ry, rz)
-                else
-                    hrp.CFrame = CFrame.new(p)
-                end
-            end
-        end
-        -- delay per-step: samakan ke FPS yang dipakai di logic lama
-        task.wait(1/30)
-    end
-    isPlaying = false
-end
-
--- Play single router by index.
--- if startNearest==true -> start from nearest checkpoint to player
-local function PlayRouterByIndex(idx, startNearest)
-    if not PathLinks[idx] then
-        warn("[Replay] Router index tidak ada:", idx)
-        return
-    end
-    local url = PathLinks[idx].url
-    local name = PathLinks[idx].name or ("Router "..tostring(idx))
-    -- load
-    local data = LoadFromGitHub(url)
-    if not data or #data == 0 then
-        warn("[Replay] Data kosong untuk router:", name)
-        return
-    end
-    records = data
-    -- compute start index
-    local startIndex = 1
-    if startNearest then
-        local posPlayer = hrp and hrp.Position or (player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character.HumanoidRootPart.Position) or Vector3.new(0,0,0)
-        startIndex = findNearestIndex(records, posPlayer)
-    end
-    -- play synchronously
-    playRecordsFrom(records, startIndex)
-end
-
--- Play all sequential starting at startIdx (non-blocking)
-local function PlayAllSequential(startIdx)
-    if isAutoPlaying then return end
-    isAutoPlaying = true
-    task.spawn(function()
-        for i = startIdx or 1, #PathLinks do
-            if not isAutoPlaying then break end
-            currentRouterIndex = i
-            -- for the very first router in the sequence, startNearest = true
-            local startNearest = (i == startIdx)
-            PlayRouterByIndex(i, startNearest)
-            -- small pause between routers if continuing
-            if isAutoPlaying then
-                task.wait(0.15)
-            end
-        end
-        isAutoPlaying = false
-    end)
-end
-
--- Stop everything immediately
-local function StopAll()
-    isAutoPlaying = false
-    isPlaying = false
-end
-
--- =========================
--- UI: preserve UI features (panel, discord, controls, list)
--- Layout meniru UI sebelumnya (sesuaikan ukuran/posisi jika mau)
--- =========================
-local guiName = "MainMap926_ReplayGui"
--- remove existing if any (prevent duplicates)
-if player:FindFirstChild("PlayerGui") then
-    local pg = player:FindFirstChild("PlayerGui")
-    local old = pg:FindFirstChild(guiName)
-    if old then old:Destroy() end
-end
-
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = guiName
-screenGui.ResetOnSpawn = false
-screenGui.Parent = player:WaitForChild("PlayerGui")
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 420, 0, 300)
-mainFrame.Position = UDim2.new(0.3, 0, 0.2, 0)
-mainFrame.BackgroundColor3 = Color3.fromRGB(28,28,28)
-mainFrame.BorderSizePixel = 0
-mainFrame.Parent = screenGui
-local frameCorner = Instance.new("UICorner", mainFrame); frameCorner.CornerRadius = UDim.new(0,10)
-
--- Title
-local title = Instance.new("TextLabel", mainFrame)
-title.Name = "Title"
-title.Size = UDim2.new(1, -20, 0, 30)
-title.Position = UDim2.new(0, 10, 0, 8)
-title.BackgroundTransparency = 1
-title.Text = "MainMap Replay v2"
-title.TextColor3 = Color3.fromRGB(235,235,235)
-title.Font = Enum.Font.SourceSansBold
-title.TextSize = 18
-
--- Discord button (preserved)
-local discordBtn = Instance.new("TextButton", mainFrame)
-discordBtn.Name = "DiscordBtn"
-discordBtn.Size = UDim2.new(0, 28, 0, 28)
-discordBtn.Position = UDim2.new(1, -38, 0, 8)
-discordBtn.Text = "D"
-discordBtn.Font = Enum.Font.SourceSansBold
-discordBtn.TextSize = 16
-discordBtn.BackgroundColor3 = Color3.fromRGB(72, 101, 199)
-local discordCorner = Instance.new("UICorner", discordBtn); discordCorner.CornerRadius = UDim.new(0,6)
--- contoh discord link (ganti sesuai kebutuhan)
-local DiscordURL = "https://discord.gg/yourserver"
-
-discordBtn.MouseButton1Click:Connect(function()
-    -- membuka link di browser (hanya efektif jika environment mengizinkan)
-    pcall(function()
-        GuiService:OpenBrowserWindow(DiscordURL)
-    end)
-end)
-
--- Router list (scrolling)
-local listFrame = Instance.new("Frame", mainFrame)
-listFrame.Name = "ListFrame"
-listFrame.Size = UDim2.new(0, 220, 0, 220)
-listFrame.Position = UDim2.new(0, 10, 0, 46)
-listFrame.BackgroundColor3 = Color3.fromRGB(22,22,22)
-local listCorner = Instance.new("UICorner", listFrame); listCorner.CornerRadius = UDim.new(0,8)
-
-local listTitle = Instance.new("TextLabel", listFrame)
-listTitle.Size = UDim2.new(1, 0, 0, 26)
-listTitle.Position = UDim2.new(0, 0, 0, 0)
-listTitle.BackgroundTransparency = 1
-listTitle.Text = "Routers"
-listTitle.TextColor3 = Color3.fromRGB(220,220,220)
-listTitle.Font = Enum.Font.SourceSansBold
-listTitle.TextSize = 14
-
-local scrolling = Instance.new("ScrollingFrame", listFrame)
-scrolling.Name = "RouterScrolling"
-scrolling.Size = UDim2.new(1, -12, 1, -36)
-scrolling.Position = UDim2.new(0, 6, 0, 30)
-scrolling.BackgroundTransparency = 1
-scrolling.BorderSizePixel = 0
-scrolling.CanvasSize = UDim2.new(0,0,0,0)
-scrolling.ScrollBarThickness = 6
-
--- controls frame (right side)
-local ctrlFrame = Instance.new("Frame", mainFrame)
-ctrlFrame.Name = "ControlFrame"
-ctrlFrame.Size = UDim2.new(0, 170, 0, 220)
-ctrlFrame.Position = UDim2.new(0, 240, 0, 46)
-ctrlFrame.BackgroundTransparency = 1
-
--- Buttons: Start, Start to End, Stop, Next, Prev
-local btnStart = Instance.new("TextButton", ctrlFrame)
-btnStart.Name = "BtnStart"
-btnStart.Size = UDim2.new(1, 0, 0, 38)
-btnStart.Position = UDim2.new(0, 0, 0, 0)
-btnStart.Text = "▶ Start (nearest)"
-btnStart.Font = Enum.Font.SourceSansBold
-btnStart.TextSize = 16
-btnStart.BackgroundColor3 = Color3.fromRGB(50,150,50)
-local btnStartCorner = Instance.new("UICorner", btnStart); btnStartCorner.CornerRadius = UDim.new(0,6)
-
-local btnStartAll = Instance.new("TextButton", ctrlFrame)
-btnStartAll.Name = "BtnStartAll"
-btnStartAll.Size = UDim2.new(1, 0, 0, 36)
-btnStartAll.Position = UDim2.new(0, 0, 0, 46)
-btnStartAll.Text = "⏵ Start to End"
-btnStartAll.Font = Enum.Font.SourceSansBold
-btnStartAll.TextSize = 15
-btnStartAll.BackgroundColor3 = Color3.fromRGB(70,120,200)
-local btnStartAllCorner = Instance.new("UICorner", btnStartAll); btnStartAllCorner.CornerRadius = UDim.new(0,6)
-
-local btnPrev = Instance.new("TextButton", ctrlFrame)
-btnPrev.Name = "BtnPrev"
-btnPrev.Size = UDim2.new(0.48, -6, 0, 34)
-btnPrev.Position = UDim2.new(0, 0, 0, 92)
-btnPrev.Text = "⟸ Prev"
-btnPrev.Font = Enum.Font.SourceSans
-btnPrev.TextSize = 14
-btnPrev.BackgroundColor3 = Color3.fromRGB(200,180,60)
-local prevCorner = Instance.new("UICorner", btnPrev); prevCorner.CornerRadius = UDim.new(0,6)
-
-local btnNext = Instance.new("TextButton", ctrlFrame)
-btnNext.Name = "BtnNext"
-btnNext.Size = UDim2.new(0.48, -6, 0, 34)
-btnNext.Position = UDim2.new(0.52, 0, 0, 92)
-btnNext.Text = "Next ⟹"
-btnNext.Font = Enum.Font.SourceSans
-btnNext.TextSize = 14
-btnNext.BackgroundColor3 = Color3.fromRGB(200,180,60)
-local nextCorner = Instance.new("UICorner", btnNext); nextCorner.CornerRadius = UDim.new(0,6)
-
-local btnStop = Instance.new("TextButton", ctrlFrame)
-btnStop.Name = "BtnStop"
-btnStop.Size = UDim2.new(1, 0, 0, 34)
-btnStop.Position = UDim2.new(0, 0, 0, 136)
-btnStop.Text = "■ Stop"
-btnStop.Font = Enum.Font.SourceSansBold
-btnStop.TextSize = 15
-btnStop.BackgroundColor3 = Color3.fromRGB(190,60,60)
-local stopCorner = Instance.new("UICorner", btnStop); stopCorner.CornerRadius = UDim.new(0,6)
-
--- label info selected router
-local infoLabel = Instance.new("TextLabel", ctrlFrame)
-infoLabel.Name = "InfoLabel"
-infoLabel.Size = UDim2.new(1, 0, 0, 44)
-infoLabel.Position = UDim2.new(0, 0, 0, 176)
-infoLabel.BackgroundTransparency = 1
-infoLabel.TextColor3 = Color3.fromRGB(230,230,230)
-infoLabel.Font = Enum.Font.SourceSans
-infoLabel.TextSize = 14
-infoLabel.TextWrapped = true
-infoLabel.Text = ""
-
--- populate list function
-local function refreshRouterList()
-    -- clear previous items
-    for _, v in ipairs(scrolling:GetChildren()) do
-        if v:IsA("TextButton") or v:IsA("TextLabel") then
-            v:Destroy()
-        end
-    end
-    local y = 0
-    for i, p in ipairs(PathLinks) do
-        local btn = Instance.new("TextButton", scrolling)
-        btn.Name = "RouterBtn_"..i
-        btn.Size = UDim2.new(1, -6, 0, 32)
-        btn.Position = UDim2.new(0, 3, 0, y)
-        btn.BackgroundColor3 = Color3.fromRGB(40,40,40)
-        btn.TextColor3 = Color3.fromRGB(230,230,230)
-        btn.Font = Enum.Font.SourceSans
-        btn.TextSize = 14
-        btn.AutoButtonColor = true
-        btn.Text = tostring(i)..". "..(p.name or ("Router "..i))
-        btn.MouseButton1Click:Connect(function()
-            currentRouterIndex = i
-            -- highlight handled by update loop below
-        end)
-        y = y + 36
-    end
-    scrolling.CanvasSize = UDim2.new(0,0,0,y)
-end
-
-refreshRouterList()
-
--- update highlight coroutine
-task.spawn(function()
-    while true do
-        for i, child in ipairs(scrolling:GetChildren()) do
-            if child:IsA("TextButton") then
-                local idx = tonumber(child.Name:match("RouterBtn_(%d+)")) or 0
-                if idx == currentRouterIndex then
-                    child.BackgroundColor3 = Color3.fromRGB(70,70,70)
-                    child.Text = "▶ "..tostring(idx)..". "..(PathLinks[idx].name or ("Router "..idx))
-                else
-                    child.BackgroundColor3 = Color3.fromRGB(40,40,40)
-                    child.Text = tostring(idx)..". "..(PathLinks[idx].name or ("Router "..idx))
-                end
-            end
-        end
-        -- update info label
-        local cur = PathLinks[currentRouterIndex]
-        if cur then
-            infoLabel.Text = ("Selected: %s\nURL: %s"):format(cur.name or ("Router "..currentRouterIndex), tostring(cur.url or ""))
+        -- use :HttpGet (executor) or HttpService:GetAsync (Studio with Http enabled)
+        if game.HttpGet then
+            return game:HttpGet(url)
         else
-            infoLabel.Text = "No router selected"
+            return HttpService:GetAsync(url)
         end
-        task.wait(0.12)
-    end
-end)
-
--- BUTTON BEHAVIOR
-
--- Start: play selected router starting from nearest checkpoint
-btnStart.MouseButton1Click:Connect(function()
-    if isPlaying then
-        -- jika sedang play, maka tombol berfungsi sebagai stop toggle
-        StopAll()
-        return
-    end
-    local idx = currentRouterIndex
-    task.spawn(function()
-        PlayRouterByIndex(idx, true)
     end)
-end)
+    if not ok then return nil, res end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(res) end)
+    if not ok2 then return nil, data end
+    return data
+end
 
--- Start to End (Play All sequential from currentRouterIndex)
-btnStartAll.MouseButton1Click:Connect(function()
-    if isAutoPlaying then
-        StopAll()
-        return
+-- Convert an array of frame-objects (with pos & rot) to CFrame table
+local function convertFrameArrayToCFrames(arr)
+    local out = {}
+    if type(arr) ~= "table" then return out end
+    for _, f in ipairs(arr) do
+        if type(f) == "table" then
+            local pos = f.pos or f.position or f.Pos or f.Position
+            local rot = f.rot or f.rotation or f.Rot or f.Rotation or {0,0,0}
+            if pos and #pos >= 3 then
+                local x,y,z = pos[1], pos[2], pos[3]
+                local rx,ry,rz = 0,0,0
+                if type(rot) == "table" and #rot >= 3 then rx,ry,rz = rot[1],rot[2],rot[3] end
+                table.insert(out, CFrame.new(x,y,z) * CFrame.Angles(rx,ry,rz))
+            end
+        end
     end
-    PlayAllSequential(currentRouterIndex)
-end)
+    return out
+end
 
--- Prev: pindah router ke prev & play from nearest
-btnPrev.MouseButton1Click:Connect(function()
-    if #PathLinks == 0 then return end
-    local prev = currentRouterIndex - 1
-    if prev < 1 then prev = #PathLinks end
-    currentRouterIndex = prev
-    -- langsung play selected from nearest
-    task.spawn(function() PlayRouterByIndex(currentRouterIndex, true) end)
-end)
+-- Try to insert routes from decoded JSON. Supports two JSON styles:
+-- 1) A single array of frames (then we add it under the provided label)
+-- 2) An object with keys = route names, values = arrays of frames (we add each)
+local function tryInsertRoutesFromData(decoded, fallbackLabel)
+    if not decoded then return false end
+    -- case 1: array of frames
+    if type(decoded) == "table" and #decoded > 0 then
+        local frames = convertFrameArrayToCFrames(decoded)
+        if #frames > 0 then
+            table.insert(routes, { tostring(fallbackLabel or "Route"), frames })
+            return true
+        end
+    end
+    -- case 2: object with multiple routes
+    if type(decoded) == "table" then
+        local inserted = false
+        for k,v in pairs(decoded) do
+            if type(v) == "table" and #v > 0 then
+                local frames = convertFrameArrayToCFrames(v)
+                if #frames > 0 then
+                    table.insert(routes, { tostring(k), frames })
+                    inserted = true
+                end
+            end
+        end
+        return inserted
+    end
+    return false
+end
 
--- Next: pindah router ke next & play from nearest
-btnNext.MouseButton1Click:Connect(function()
-    if #PathLinks == 0 then return end
-    local nxt = currentRouterIndex + 1
-    if nxt > #PathLinks then nxt = 1 end
-    currentRouterIndex = nxt
-    task.spawn(function() PlayRouterByIndex(currentRouterIndex, true) end)
-end)
-
--- Stop: hentikan apapun
-btnStop.MouseButton1Click:Connect(function()
-    StopAll()
-end)
-
--- expose simple debug API (opsional)
-_G.MainMap926_Replay = _G.MainMap926_Replay or {}
-_G.MainMap926_Replay.PathLinks = PathLinks
-_G.MainMap926_Replay.PlaySelectedNearest = function() task.spawn(function() PlayRouterByIndex(currentRouterIndex, true) end) end
-_G.MainMap926_Replay.PlayAll = function() PlayAllSequential(1) end
-_G.MainMap926_Replay.Stop = StopAll
-
--- Final note: jika mau tambahkan link baru cukup edit PathLinks table
--- atau gunakan _G.MainMap926_Replay.PathLinks = {...} di runtime lalu refresh list:
-local function RefreshFromGlobal()
-    if _G.MainMap926_Replay and type(_G.MainMap926_Replay.PathLinks) == "table" then
-        PathLinks = _G.MainMap926_Replay.PathLinks
-        refreshRouterList()
+-- Load all routes configured in routeLinks
+for label, url in pairs(routeLinks) do
+    local data, err = fetchJson(url)
+    if data then
+        local ok = tryInsertRoutesFromData(data, label)
+        if ok then
+            print("[WataX] Loaded route:", label, "(from", url, ")")
+        else
+            warn("[WataX] No frames found in:", url, "(label:", label, ")")
+        end
+    else
+        warn("[WataX] Failed to fetch:", url, "error:", err)
     end
 end
 
--- support: listen untuk perubahan PathLinks via _G (opsional)
-task.spawn(function()
-    while true do
-        RefreshFromGlobal()
-        task.wait(1.0)
+-- If no routes were loaded, warn user (UI tetap berfungsi but Start won't do anything)
+if #routes == 0 then
+    warn("[WataX] Warning: no routes loaded. Edit 'routeLinks' at the top of the script to point to your JSON files.")
+end
+
+-- -------------------- existing helper functions (kept intact) --------------------
+local function getNearestRoute()
+    local nearestIdx, dist = 1, math.huge
+    if hrp then
+        local pos = hrp.Position
+        for i,data in ipairs(routes) do
+            for _,cf in ipairs(data[2]) do
+                local d = (cf.Position - pos).Magnitude
+                if d < dist then
+                    dist = d
+                    nearestIdx = i
+                end
+            end
+        end
     end
+    return nearestIdx
+end
+
+local function getNearestFrameIndex(frames)
+    local startIdx, dist = 1, math.huge
+    if hrp then
+        local pos = hrp.Position
+        for i,cf in ipairs(frames) do
+            local d = (cf.Position - pos).Magnitude
+            if d < dist then
+                dist = d
+                startIdx = i
+            end
+        end
+    end
+    if startIdx >= #frames then
+        startIdx = math.max(1, #frames - 1)
+    end
+    return startIdx
+end
+
+local function lerpCF(fromCF, toCF)
+    local duration = frameTime / math.max(0.05, playbackRate)
+    local t = 0
+    while t < duration do
+        if not isRunning then break end
+        local dt = task.wait()
+        t += dt
+        local alpha = math.min(t / duration, 1)
+        if hrp and hrp.Parent and hrp:IsDescendantOf(workspace) then
+            hrp.CFrame = fromCF:Lerp(toCF, alpha)
+        end
+    end
+end
+
+local function runRouteOnce()
+    if #routes == 0 then return end
+    if not hrp then refreshHRP() end
+    isRunning = true
+    local idx = getNearestRoute()
+    print("▶ Start CP:", routes[idx][1])
+    local frames = routes[idx][2]
+    if #frames < 2 then isRunning = false return end
+    local startIdx = getNearestFrameIndex(frames)
+    for i = startIdx, #frames - 1 do
+        if not isRunning then break end
+        lerpCF(frames[i], frames[i+1])
+    end
+    isRunning = false
+end
+
+local function runAllRoutes()
+    if #routes == 0 then return end
+    if not hrp then refreshHRP() end
+    isRunning = true
+    local idx = getNearestRoute()
+    print("⏩ Start To End dari:", routes[idx][1])
+    for r = idx, #routes do
+        if not isRunning then break end
+        local frames = routes[r][2]
+        if #frames < 2 then continue end
+        -- PATCH: always use nearest frame index, not just for the first route
+        local startIdx = getNearestFrameIndex(frames)
+        for i = startIdx, #frames - 1 do
+            if not isRunning then break end
+            lerpCF(frames[i], frames[i+1])
+        end
+    end
+    isRunning = false
+end
+
+local function stopRoute()
+    if isRunning then
+        print("⏹ Stop ditekan")
+    end
+    isRunning = false
+end
+-- ---------------------------------------------------------------------------------
+
+-- -------------------- UI (exactly as in original mainmap926.lua) -----------------
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "WataXReplay"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = game.CoreGui
+
+local frame = Instance.new("Frame",screenGui)
+frame.Size = UDim2.new(0,280,0,180)
+frame.Position = UDim2.new(0.5,-140,0.5,-90)
+frame.BackgroundColor3 = Color3.fromRGB(35,35,40)
+frame.Active = true
+frame.Draggable = true
+frame.BackgroundTransparency = 0.05
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0,12)
+
+local title = Instance.new("TextLabel",frame)
+title.Size = UDim2.new(1,0,0,32)
+title.Text = "WataX Menu"
+title.BackgroundColor3 = Color3.fromRGB(55,55,65)
+title.TextColor3 = Color3.fromRGB(255,255,255)
+title.Font = Enum.Font.GothamBold
+title.TextScaled = true
+Instance.new("UICorner", title).CornerRadius = UDim.new(0,12)
+
+local startCP = Instance.new("TextButton",frame)
+startCP.Size = UDim2.new(0.5,-7,0,42)
+startCP.Position = UDim2.new(0,5,0,44)
+startCP.Text = "Start CP"
+startCP.BackgroundColor3 = Color3.fromRGB(60,200,80)
+startCP.TextColor3 = Color3.fromRGB(255,255,255)
+startCP.Font = Enum.Font.GothamBold
+startCP.TextScaled = true
+Instance.new("UICorner", startCP).CornerRadius = UDim.new(0,10)
+startCP.MouseButton1Click:Connect(runRouteOnce)
+
+local stopBtn = Instance.new("TextButton",frame)
+stopBtn.Size = UDim2.new(0.5,-7,0,42)
+stopBtn.Position = UDim2.new(0.5,2,0,44)
+stopBtn.Text = "Stop"
+stopBtn.BackgroundColor3 = Color3.fromRGB(220,70,70)
+stopBtn.TextColor3 = Color3.fromRGB(255,255,255)
+stopBtn.Font = Enum.Font.GothamBold
+stopBtn.TextScaled = true
+Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0,10)
+stopBtn.MouseButton1Click:Connect(stopRoute)
+
+local startAll = Instance.new("TextButton",frame)
+startAll.Size = UDim2.new(1,-10,0,42)
+startAll.Position = UDim2.new(0,5,0,96)
+startAll.Text = "Start To End"
+startAll.BackgroundColor3 = Color3.fromRGB(70,120,220)
+startAll.TextColor3 = Color3.fromRGB(255,255,255)
+startAll.Font = Enum.Font.GothamBold
+startAll.TextScaled = true
+Instance.new("UICorner", startAll).CornerRadius = UDim.new(0,10)
+startAll.MouseButton1Click:Connect(runAllRoutes)
+
+-- Close button (top-left)
+local closeBtn = Instance.new("TextButton", frame)
+closeBtn.Size = UDim2.new(0,30,0,30)
+closeBtn.Position = UDim2.new(0,0,0,0)
+closeBtn.Text = "✖"
+closeBtn.BackgroundColor3 = Color3.fromRGB(220,60,60)
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextScaled = true
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0,8)
+closeBtn.MouseButton1Click:Connect(function()
+    if screenGui then screenGui:Destroy() end
 end)
 
+-- Minimize / Bubble
+local miniBtn = Instance.new("TextButton", frame)
+miniBtn.Size = UDim2.new(0,30,0,30)
+miniBtn.Position = UDim2.new(1,-30,0,0)
+miniBtn.Text = "—"
+miniBtn.BackgroundColor3 = Color3.fromRGB(80,80,200)
+miniBtn.TextColor3 = Color3.fromRGB(255,255,255)
+miniBtn.Font = Enum.Font.GothamBold
+miniBtn.TextScaled = true
+Instance.new("UICorner", miniBtn).CornerRadius = UDim.new(0,8)
 
-print("[MainMap926] Replay GUI ready. Routers:", #PathLinks)
+local bubbleBtn = Instance.new("TextButton", screenGui)
+bubbleBtn.Size = UDim2.new(0,80,0,46)
+bubbleBtn.Position = UDim2.new(0,20,0.7,0)
+bubbleBtn.Text = "WataX"
+bubbleBtn.BackgroundColor3 = Color3.fromRGB(0,140,220)
+bubbleBtn.TextColor3 = Color3.fromRGB(255,255,255)
+bubbleBtn.Font = Enum.Font.GothamBold
+bubbleBtn.TextScaled = true
+bubbleBtn.Visible = false
+bubbleBtn.Active = true
+bubbleBtn.Draggable = true
+Instance.new("UICorner", bubbleBtn).CornerRadius = UDim.new(0,14)
+
+miniBtn.MouseButton1Click:Connect(function()
+    frame.Visible = false
+    bubbleBtn.Visible = true
+end)
+bubbleBtn.MouseButton1Click:Connect(function()
+    frame.Visible = true
+    bubbleBtn.Visible = false
+end)
+
+-- Discord button (bottom-left)
+local discordBtn = Instance.new("TextButton", frame)
+discordBtn.Size = UDim2.new(0,100,0,30)
+discordBtn.AnchorPoint = Vector2.new(0,1)
+discordBtn.Position = UDim2.new(0,5,1,-5)
+discordBtn.Text = "Discord"
+discordBtn.BackgroundColor3 = Color3.fromRGB(90,90,220)
+discordBtn.TextColor3 = Color3.fromRGB(255,255,255)
+discordBtn.Font = Enum.Font.GothamBold
+discordBtn.TextScaled = true
+Instance.new("UICorner", discordBtn).CornerRadius = UDim.new(0,8)
+-- ---------------------------------------------------------------------------------
+
+print("[WataX] UI ready. Routes loaded:")
+for i,rt in ipairs(routes) do
+    print(i, rt[1], "frames:", #rt[2])
+end
