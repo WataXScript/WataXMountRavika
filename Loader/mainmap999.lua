@@ -1,5 +1,4 @@
--- WataX Replay (JSON loader + preserve original UI)
--- Full version: UI from mainmap926.lua left intact, but routes are loaded from JSON (GitHub raw).
+-- WataX Replay (Mainmap926.lua clone, routes dari JSON)
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -20,104 +19,30 @@ local playbackRate = 1.0
 local isRunning = false
 local routes = {}
 
--- ==================== CONFIG: ganti URL di bawah sesuai repo kamu ====================
--- Format: ["Label"] = "https://raw.githubusercontent.com/username/repo/branch/filename.json"
--- Contoh: ["CP0 → CP1"] = "https://raw.githubusercontent.com/me/replays/main/cp0to1.json"
-local routeLinks = {
-    -- contohnya satu route: bisa diganti
-    ["CP0 → CP1"] = "https://raw.githubusercontent.com/WataXScript/WataXMountRavika/main/Loader/ravika.json",
-    -- tambahin baris lain kalau mau banyak route
-    -- ["CP1 → CP2"] = "https://raw.githubusercontent.com/username/repo/branch/cp1to2.json",
-}
--- ====================================================================================
+-- ================= ROUTES LOADER (JSON) =================
+-- ganti link JSON kamu di sini
+local url = "https://raw.githubusercontent.com/WataXScript/WataXMountRavika/main/Loader/ravika.json"
 
--- Helper: fetch & decode JSON safely
-local function fetchJson(url)
-    if not url or url == "" then return nil, "no url" end
-    local ok, res = pcall(function()
-        -- use :HttpGet (executor) or HttpService:GetAsync (Studio with Http enabled)
-        if game.HttpGet then
-            return game:HttpGet(url)
-        else
-            return HttpService:GetAsync(url)
+local function loadRoutes()
+    local response = game:HttpGet(url)
+    local data = HttpService:JSONDecode(response)
+    local loaded = {}
+    for name, frames in pairs(data) do
+        local cframes = {}
+        for _, f in ipairs(frames) do
+            local pos = f.pos
+            local rot = f.rot
+            local cf = CFrame.new(pos[1], pos[2], pos[3]) * CFrame.Angles(rot[1], rot[2], rot[3])
+            table.insert(cframes, cf)
         end
-    end)
-    if not ok then return nil, res end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(res) end)
-    if not ok2 then return nil, data end
-    return data
-end
-
--- Convert an array of frame-objects (with pos & rot) to CFrame table
-local function convertFrameArrayToCFrames(arr)
-    local out = {}
-    if type(arr) ~= "table" then return out end
-    for _, f in ipairs(arr) do
-        if type(f) == "table" then
-            local pos = f.pos or f.position or f.Pos or f.Position
-            local rot = f.rot or f.rotation or f.Rot or f.Rotation or {0,0,0}
-            if pos and #pos >= 3 then
-                local x,y,z = pos[1], pos[2], pos[3]
-                local rx,ry,rz = 0,0,0
-                if type(rot) == "table" and #rot >= 3 then rx,ry,rz = rot[1],rot[2],rot[3] end
-                table.insert(out, CFrame.new(x,y,z) * CFrame.Angles(rx,ry,rz))
-            end
-        end
+        table.insert(loaded, {name, cframes})
     end
-    return out
+    return loaded
 end
 
--- Try to insert routes from decoded JSON. Supports two JSON styles:
--- 1) A single array of frames (then we add it under the provided label)
--- 2) An object with keys = route names, values = arrays of frames (we add each)
-local function tryInsertRoutesFromData(decoded, fallbackLabel)
-    if not decoded then return false end
-    -- case 1: array of frames
-    if type(decoded) == "table" and #decoded > 0 then
-        local frames = convertFrameArrayToCFrames(decoded)
-        if #frames > 0 then
-            table.insert(routes, { tostring(fallbackLabel or "Route"), frames })
-            return true
-        end
-    end
-    -- case 2: object with multiple routes
-    if type(decoded) == "table" then
-        local inserted = false
-        for k,v in pairs(decoded) do
-            if type(v) == "table" and #v > 0 then
-                local frames = convertFrameArrayToCFrames(v)
-                if #frames > 0 then
-                    table.insert(routes, { tostring(k), frames })
-                    inserted = true
-                end
-            end
-        end
-        return inserted
-    end
-    return false
-end
+routes = loadRoutes()
+-- =========================================================
 
--- Load all routes configured in routeLinks
-for label, url in pairs(routeLinks) do
-    local data, err = fetchJson(url)
-    if data then
-        local ok = tryInsertRoutesFromData(data, label)
-        if ok then
-            print("[WataX] Loaded route:", label, "(from", url, ")")
-        else
-            warn("[WataX] No frames found in:", url, "(label:", label, ")")
-        end
-    else
-        warn("[WataX] Failed to fetch:", url, "error:", err)
-    end
-end
-
--- If no routes were loaded, warn user (UI tetap berfungsi but Start won't do anything)
-if #routes == 0 then
-    warn("[WataX] Warning: no routes loaded. Edit 'routeLinks' at the top of the script to point to your JSON files.")
-end
-
--- -------------------- existing helper functions (kept intact) --------------------
 local function getNearestRoute()
     local nearestIdx, dist = 1, math.huge
     if hrp then
@@ -136,21 +61,18 @@ local function getNearestRoute()
 end
 
 local function getNearestFrameIndex(frames)
-    local startIdx, dist = 1, math.huge
+    local idx, dist = 1, math.huge
     if hrp then
         local pos = hrp.Position
         for i,cf in ipairs(frames) do
             local d = (cf.Position - pos).Magnitude
             if d < dist then
                 dist = d
-                startIdx = i
+                idx = i
             end
         end
     end
-    if startIdx >= #frames then
-        startIdx = math.max(1, #frames - 1)
-    end
-    return startIdx
+    return idx
 end
 
 local function lerpCF(fromCF, toCF)
@@ -161,7 +83,7 @@ local function lerpCF(fromCF, toCF)
         local dt = task.wait()
         t += dt
         local alpha = math.min(t / duration, 1)
-        if hrp and hrp.Parent and hrp:IsDescendantOf(workspace) then
+        if hrp and hrp.Parent then
             hrp.CFrame = fromCF:Lerp(toCF, alpha)
         end
     end
@@ -172,11 +94,9 @@ local function runRouteOnce()
     if not hrp then refreshHRP() end
     isRunning = true
     local idx = getNearestRoute()
-    print("▶ Start CP:", routes[idx][1])
     local frames = routes[idx][2]
-    if #frames < 2 then isRunning = false return end
     local startIdx = getNearestFrameIndex(frames)
-    for i = startIdx, #frames - 1 do
+    for i = startIdx, #frames-1 do
         if not isRunning then break end
         lerpCF(frames[i], frames[i+1])
     end
@@ -188,14 +108,10 @@ local function runAllRoutes()
     if not hrp then refreshHRP() end
     isRunning = true
     local idx = getNearestRoute()
-    print("⏩ Start To End dari:", routes[idx][1])
     for r = idx, #routes do
-        if not isRunning then break end
         local frames = routes[r][2]
-        if #frames < 2 then continue end
-        -- PATCH: always use nearest frame index, not just for the first route
         local startIdx = getNearestFrameIndex(frames)
-        for i = startIdx, #frames - 1 do
+        for i = startIdx, #frames-1 do
             if not isRunning then break end
             lerpCF(frames[i], frames[i+1])
         end
@@ -204,22 +120,18 @@ local function runAllRoutes()
 end
 
 local function stopRoute()
-    if isRunning then
-        print("⏹ Stop ditekan")
-    end
     isRunning = false
 end
--- ---------------------------------------------------------------------------------
 
--- -------------------- UI (exactly as in original mainmap926.lua) -----------------
+-- ================= UI (persis mainmap926.lua) =================
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "WataXReplay"
 screenGui.ResetOnSpawn = false
-screenGui.Parent = game.CoreGui
+screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame",screenGui)
-frame.Size = UDim2.new(0,280,0,180)
-frame.Position = UDim2.new(0.5,-140,0.5,-90)
+frame.Size = UDim2.new(0,280,0,220)
+frame.Position = UDim2.new(0.5,-140,0.5,-110)
 frame.BackgroundColor3 = Color3.fromRGB(35,35,40)
 frame.Active = true
 frame.Draggable = true
@@ -268,7 +180,34 @@ startAll.TextScaled = true
 Instance.new("UICorner", startAll).CornerRadius = UDim.new(0,10)
 startAll.MouseButton1Click:Connect(runAllRoutes)
 
--- Close button (top-left)
+local speedUp = Instance.new("TextButton", frame)
+speedUp.Size = UDim2.new(0.5,-7,0,30)
+speedUp.Position = UDim2.new(0,5,0,148)
+speedUp.Text = "Speed +"
+speedUp.BackgroundColor3 = Color3.fromRGB(70,200,120)
+speedUp.TextColor3 = Color3.fromRGB(255,255,255)
+speedUp.Font = Enum.Font.GothamBold
+speedUp.TextScaled = true
+Instance.new("UICorner", speedUp).CornerRadius = UDim.new(0,8)
+speedUp.MouseButton1Click:Connect(function()
+    playbackRate = playbackRate + 0.5
+    print("Replay speed:", playbackRate, "x")
+end)
+
+local speedDown = Instance.new("TextButton", frame)
+speedDown.Size = UDim2.new(0.5,-7,0,30)
+speedDown.Position = UDim2.new(0.5,2,0,148)
+speedDown.Text = "Speed -"
+speedDown.BackgroundColor3 = Color3.fromRGB(200,120,70)
+speedDown.TextColor3 = Color3.fromRGB(255,255,255)
+speedDown.Font = Enum.Font.GothamBold
+speedDown.TextScaled = true
+Instance.new("UICorner", speedDown).CornerRadius = UDim.new(0,8)
+speedDown.MouseButton1Click:Connect(function()
+    playbackRate = math.max(0.1, playbackRate - 0.5)
+    print("Replay speed:", playbackRate, "x")
+end)
+
 local closeBtn = Instance.new("TextButton", frame)
 closeBtn.Size = UDim2.new(0,30,0,30)
 closeBtn.Position = UDim2.new(0,0,0,0)
@@ -282,7 +221,6 @@ closeBtn.MouseButton1Click:Connect(function()
     if screenGui then screenGui:Destroy() end
 end)
 
--- Minimize / Bubble
 local miniBtn = Instance.new("TextButton", frame)
 miniBtn.Size = UDim2.new(0,30,0,30)
 miniBtn.Position = UDim2.new(1,-30,0,0)
@@ -315,7 +253,6 @@ bubbleBtn.MouseButton1Click:Connect(function()
     bubbleBtn.Visible = false
 end)
 
--- Discord button (bottom-left)
 local discordBtn = Instance.new("TextButton", frame)
 discordBtn.Size = UDim2.new(0,100,0,30)
 discordBtn.AnchorPoint = Vector2.new(0,1)
@@ -326,7 +263,14 @@ discordBtn.TextColor3 = Color3.fromRGB(255,255,255)
 discordBtn.Font = Enum.Font.GothamBold
 discordBtn.TextScaled = true
 Instance.new("UICorner", discordBtn).CornerRadius = UDim.new(0,8)
--- ---------------------------------------------------------------------------------
+discordBtn.MouseButton1Click:Connect(function()
+    if setclipboard then
+        setclipboard("https://discord.gg/namaserver")
+        print("[WataX] Discord link copied")
+    else
+        warn("setclipboard not supported")
+    end
+end)
 
 print("[WataX] UI ready. Routes loaded:")
 for i,rt in ipairs(routes) do
