@@ -24,7 +24,7 @@ local hrp = char:WaitForChild("HumanoidRootPart")
 -- masukkan link raw github JSON kalian di sini
 -- contoh format file JSON: [{"pos":[x,y,z],"rot":[rx,ry,rz]}, ...]
 local PathLinks = {
-    { name = "Router 1 - Ravika", url = "https://raw.githubusercontent.com/username/Loader/branch/replayravika.json" },
+    { name = "Router 1 - Ravika", url = "https://raw.githubusercontent.com/WataXScript/WataXMountRavika/Loader/ravika.json" },
     -- contoh tambahan:
     -- { name = "Router 2 - test", url = "https://raw.githubusercontent.com/username/Loader/branch/replay2.json" },
     -- { name = "Router 3 - etc", url = "https://raw.githubusercontent.com/username/Loader/branch/replay3.json" },
