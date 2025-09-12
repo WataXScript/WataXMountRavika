@@ -5,7 +5,7 @@ local TweenService = game:GetService("TweenService")
 local UIS = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 
-local saveFile = "WataX_Key.txt"
+local saveFile = "WataX_Key_rvk.txt"
 
 
 local function saveKey(k)
