@@ -11216,6 +11216,31 @@ local function stopRoute()
     isRunning = false
 end
 
+local DEFAULT_HEIGHT = 2.900038719177246
+
+local function getCurrentHeight()
+    local char = player.Character or player.CharacterAdded:Wait()
+    local humanoid = char:WaitForChild("Humanoid")
+    return humanoid.HipHeight + (char:FindFirstChild("Head") and char.Head.Size.Y or 2)
+end
+
+local function adjustRoute(frames)
+    local adjusted = {}
+    local currentHeight = getCurrentHeight()
+    local offsetY = currentHeight - DEFAULT_HEIGHT
+    for _, cf in ipairs(frames) do
+        local pos, rot = cf.Position, cf - cf.Position
+        table.insert(adjusted,
+            CFrame.new(Vector3.new(pos.X, pos.Y + offsetY, pos.Z)) * rot
+        )
+    end
+    return adjusted
+end
+
+for i, data in ipairs(routes) do
+    data[2] = adjustRoute(data[2])
+end
+
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "WataXReplay"
