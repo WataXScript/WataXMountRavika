@@ -1,20 +1,22 @@
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
-local hrp = nil
-
-_G.WataX_Replay = _G.WataX_Replay or true
-if not _G.WataX_Replay then return end
+local hrp
 
 
 local ROUTE_LINKS = {
     "https://raw.githubusercontent.com/WataXScAja/WataXScIni/refs/heads/main/50.lua",
-    "https://raw.githubusercontent.com/USERNAME/REPO/main/route2.lua",
-    "https://raw.githubusercontent.com/USERNAME/REPO/main/route3.lua",
 }
 
 
 local routes = {}
+local animConn
+local isMoving = false
+local frameTime = 1/30
+local playbackRate = 1
+local isReplayRunning = false
 
 
 for i, link in ipairs(ROUTE_LINKS) do
@@ -23,28 +25,74 @@ for i, link in ipairs(ROUTE_LINKS) do
             return loadstring(game:HttpGet(link))()
         end)
         if ok and typeof(data) == "table" and #data > 0 then
-            table.insert(routes, {"Route " .. i, data})
+            table.insert(routes, {"Route "..i, data})
         end
     end
 end
+if #routes == 0 then warn("Tidak ada route valid ditemukan.") return end
 
-if #routes == 0 then
-    warn("[WataX Replay] Tidak ada route valid ditemukan.")
-    return
-end
 
 local function refreshHRP(char)
-    if not char then
-        char = player.Character or player.CharacterAdded:Wait()
-    end
+    if not char then char = player.Character or player.CharacterAdded:Wait() end
     hrp = char:WaitForChild("HumanoidRootPart")
 end
-if player.Character then refreshHRP(player.Character) end
 player.CharacterAdded:Connect(refreshHRP)
+if player.Character then refreshHRP(player.Character) end
 
-local frameTime = 1/30
-local playbackRate = 1.0
-local isRunning = false
+
+local function setupMovement(char)
+    local humanoid = char:WaitForChild("Humanoid")
+    local lastPos = char.HumanoidRootPart.Position
+    local jumpCooldown = false
+    if animConn then animConn:Disconnect() end
+    animConn = RunService.RenderStepped:Connect(function()
+        if not isMoving then return end
+        if not hrp or not hrp.Parent then return end
+
+        local direction = hrp.Position - lastPos
+        local dist = direction.Magnitude
+        if dist > 0.01 then
+            humanoid:Move(direction.Unit * math.clamp(dist*5,0,1), false)
+        else
+            humanoid:Move(Vector3.zero,false)
+        end
+
+        local deltaY = hrp.Position.Y - lastPos.Y
+        if deltaY > 0.9 and not jumpCooldown then
+            humanoid.Jump = true
+            jumpCooldown = true
+            task.delay(0.4,function() jumpCooldown=false end)
+        end
+        lastPos = hrp.Position
+    end)
+end
+player.CharacterAdded:Connect(setupMovement)
+if player.Character then setupMovement(player.Character) end
+
+local function startMovement() isMoving=true end
+local function stopMovement() isMoving=false end
+
+
+local DEFAULT_HEIGHT = 2.9
+local function getCurrentHeight()
+    local char = player.Character or player.CharacterAdded:Wait()
+    local humanoid = char:WaitForChild("Humanoid")
+    return humanoid.HipHeight + (char:FindFirstChild("Head") and char.Head.Size.Y or 2)
+end
+
+local function adjustRoute(frames)
+    local adjusted = {}
+    local offsetY = getCurrentHeight() - DEFAULT_HEIGHT
+    for _,cf in ipairs(frames) do
+        local pos, rot = cf.Position, cf - cf.Position
+        table.insert(adjusted, CFrame.new(Vector3.new(pos.X,pos.Y+offsetY,pos.Z)) * rot)
+    end
+    return adjusted
+end
+
+for i, data in ipairs(routes) do
+    data[2] = adjustRoute(data[2])
+end
 
 local function getNearestRoute()
     local nearestIdx, dist = 1, math.huge
@@ -53,10 +101,7 @@ local function getNearestRoute()
         for i,data in ipairs(routes) do
             for _,cf in ipairs(data[2]) do
                 local d = (cf.Position - pos).Magnitude
-                if d < dist then
-                    dist = d
-                    nearestIdx = i
-                end
+                if d < dist then dist=d nearestIdx=i end
             end
         end
     end
@@ -69,247 +114,186 @@ local function getNearestFrameIndex(frames)
         local pos = hrp.Position
         for i,cf in ipairs(frames) do
             local d = (cf.Position - pos).Magnitude
-            if d < dist then
-                dist = d
-                startIdx = i
-            end
+            if d < dist then dist=d startIdx=i end
         end
     end
-    if startIdx >= #frames then
-        startIdx = math.max(1, #frames - 1)
-    end
+    if startIdx >= #frames then startIdx = math.max(1,#frames-1) end
     return startIdx
 end
 
-local function lerpCF(fromCF, toCF)
-    local duration = frameTime / math.max(0.05, playbackRate)
+local function lerpCF(fromCF,toCF)
+    local duration = frameTime/math.max(0.05,playbackRate)
     local t = 0
     while t < duration do
-        if not isRunning then break end
+        if not isReplayRunning then break end
         local dt = task.wait()
         t += dt
-        local alpha = math.min(t / duration, 1)
+        local alpha = math.min(t/duration,1)
         if hrp and hrp.Parent and hrp:IsDescendantOf(workspace) then
-            hrp.CFrame = fromCF:Lerp(toCF, alpha)
+            hrp.CFrame = fromCF:Lerp(toCF,alpha)
         end
     end
 end
 
-local function runRouteOnce()
-    if #routes == 0 then return end
+local function runRoute()
+    if #routes==0 then return end
     if not hrp then refreshHRP() end
-    isRunning = true
+    isReplayRunning = true
+    startMovement()
     local idx = getNearestRoute()
     local frames = routes[idx][2]
-    if #frames < 2 then isRunning = false return end
+    if #frames<2 then isReplayRunning=false return end
     local startIdx = getNearestFrameIndex(frames)
-    for i = startIdx, #frames - 1 do
-        if not isRunning then break end
-        lerpCF(frames[i], frames[i+1])
+    for i=startIdx,#frames-1 do
+        if not isReplayRunning then break end
+        lerpCF(frames[i],frames[i+1])
     end
-    isRunning = false
-end
-
-local function runAllRoutes()
-    if #routes == 0 then return end
-    if not hrp then refreshHRP() end
-    isRunning = true
-    local idx = getNearestRoute()
-    for r = idx, #routes do
-        if not isRunning then break end
-        local frames = routes[r][2]
-        if #frames < 2 then continue end
-        local startIdx = getNearestFrameIndex(frames)
-        for i = startIdx, #frames - 1 do
-            if not isRunning then break end
-            lerpCF(frames[i], frames[i+1])
-        end
-    end
-    isRunning = false
+    isReplayRunning=false
+    stopMovement()
 end
 
 local function stopRoute()
-    isRunning = false
+    isReplayRunning=false
+    stopMovement()
 end
 
-
-local DEFAULT_HEIGHT = 2.900038719177246
-local function getCurrentHeight()
-    local char = player.Character or player.CharacterAdded:Wait()
-    local humanoid = char:WaitForChild("Humanoid")
-    return humanoid.HipHeight + (char:FindFirstChild("Head") and char.Head.Size.Y or 2)
-end
-local function adjustRoute(frames)
-    local adjusted = {}
-    local currentHeight = getCurrentHeight()
-    local offsetY = currentHeight - DEFAULT_HEIGHT
-    for _, cf in ipairs(frames) do
-        local pos, rot = cf.Position, cf - cf.Position
-        table.insert(adjusted,
-            CFrame.new(Vector3.new(pos.X, pos.Y + offsetY, pos.Z)) * rot
-        )
-    end
-    return adjusted
-end
-for i, data in ipairs(routes) do
-    data[2] = adjustRoute(data[2])
-end
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "WataXReplay"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = game.CoreGui
+screenGui.Name="WataXReplayUI"
+screenGui.Parent=game.CoreGui
 
-local frame = Instance.new("Frame",screenGui)
-frame.Size = UDim2.new(0,280,0,180)
-frame.Position = UDim2.new(0.5,-140,0.5,-90)
-frame.BackgroundColor3 = Color3.fromRGB(35,35,40)
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 220, 0, 130) -- frame pas
+frame.Position = UDim2.new(0.05,0,0.75,0)
+frame.BackgroundColor3 = Color3.fromRGB(50,30,70)
+frame.BackgroundTransparency = 0.3
 frame.Active = true
 frame.Draggable = true
-frame.BackgroundTransparency = 0.05
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0,12)
+frame.Parent = screenGui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0,16)
 
-local title = Instance.new("TextLabel",frame)
-title.Size = UDim2.new(1,0,0,32)
-title.Text = "WataX Menu"
-title.BackgroundColor3 = Color3.fromRGB(55,55,65)
-title.TextColor3 = Color3.fromRGB(255,255,255)
+local glow = Instance.new("UIStroke")
+glow.Parent = frame
+glow.Color = Color3.fromRGB(180,120,255)
+glow.Thickness = 2
+glow.Transparency = 0.4
+
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(0.75,0,0,28)
+title.Position = UDim2.new(0.05,0,0,4)
+title.Text = "WataX Script"
 title.Font = Enum.Font.GothamBold
 title.TextScaled = true
+title.BackgroundTransparency = 0.3
+title.BackgroundColor3 = Color3.fromRGB(70,40,120)
 Instance.new("UICorner", title).CornerRadius = UDim.new(0,12)
 
-local startCP = Instance.new("TextButton",frame)
-startCP.Size = UDim2.new(0.5,-7,0,42)
-startCP.Position = UDim2.new(0,5,0,44)
-startCP.Text = "Start CP"
-startCP.BackgroundColor3 = Color3.fromRGB(60,200,80)
-startCP.TextColor3 = Color3.fromRGB(255,255,255)
-startCP.Font = Enum.Font.GothamBold
-startCP.TextScaled = true
-Instance.new("UICorner", startCP).CornerRadius = UDim.new(0,10)
-startCP.MouseButton1Click:Connect(runRouteOnce)
 
-local stopBtn = Instance.new("TextButton",frame)
-stopBtn.Size = UDim2.new(0.5,-7,0,42)
-stopBtn.Position = UDim2.new(0.5,2,0,44)
-stopBtn.Text = "Stop"
-stopBtn.BackgroundColor3 = Color3.fromRGB(220,70,70)
-stopBtn.TextColor3 = Color3.fromRGB(255,255,255)
-stopBtn.Font = Enum.Font.GothamBold
-stopBtn.TextScaled = true
-Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0,10)
-stopBtn.MouseButton1Click:Connect(stopRoute)
+local hue = 0
+RunService.RenderStepped:Connect(function()
+    hue = (hue + 0.5) % 360
+    title.TextColor3 = Color3.fromHSV(hue/360,1,1)
+end)
 
-local startAll = Instance.new("TextButton",frame)
-startAll.Size = UDim2.new(1,-10,0,42)
-startAll.Position = UDim2.new(0,5,0,96)
-startAll.Text = "Start To End"
-startAll.BackgroundColor3 = Color3.fromRGB(70,120,220)
-startAll.TextColor3 = Color3.fromRGB(255,255,255)
-startAll.Font = Enum.Font.GothamBold
-startAll.TextScaled = true
-Instance.new("UICorner", startAll).CornerRadius = UDim.new(0,10)
-startAll.MouseButton1Click:Connect(runAllRoutes)
 
 local closeBtn = Instance.new("TextButton", frame)
-closeBtn.Size = UDim2.new(0,30,0,30)
-closeBtn.Position = UDim2.new(0,0,0,0)
+closeBtn.Size = UDim2.new(0,28,0,28)
+closeBtn.Position = UDim2.new(0.78,0,0,4)
 closeBtn.Text = "✖"
-closeBtn.BackgroundColor3 = Color3.fromRGB(220,60,60)
-closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
 closeBtn.Font = Enum.Font.GothamBold
 closeBtn.TextScaled = true
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0,8)
+closeBtn.BackgroundColor3 = Color3.fromRGB(180,60,60)
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0,10)
+
+local closeGlow = Instance.new("UIStroke")
+closeGlow.Parent = closeBtn
+closeGlow.Color = Color3.fromRGB(255,0,100)
+closeGlow.Thickness = 2
+closeGlow.Transparency = 0.6
+
+closeBtn.MouseEnter:Connect(function()
+    TweenService:Create(closeGlow, TweenInfo.new(0.2), {Transparency=0.1, Thickness=4}):Play()
+end)
+closeBtn.MouseLeave:Connect(function()
+    TweenService:Create(closeGlow, TweenInfo.new(0.2), {Transparency=0.6, Thickness=2}):Play()
+end)
 closeBtn.MouseButton1Click:Connect(function()
-    if screenGui then screenGui:Destroy() end
+    screenGui:Destroy()
 end)
 
-local miniBtn = Instance.new("TextButton", frame)
-miniBtn.Size = UDim2.new(0,30,0,30)
-miniBtn.Position = UDim2.new(1,-30,0,0)
-miniBtn.Text = "—"
-miniBtn.BackgroundColor3 = Color3.fromRGB(80,80,200)
-miniBtn.TextColor3 = Color3.fromRGB(255,255,255)
-miniBtn.Font = Enum.Font.GothamBold
-miniBtn.TextScaled = true
-Instance.new("UICorner", miniBtn).CornerRadius = UDim.new(0,8)
 
-local bubbleBtn = Instance.new("TextButton", screenGui)
-bubbleBtn.Size = UDim2.new(0,80,0,46)
-bubbleBtn.Position = UDim2.new(0,20,0.7,0)
-bubbleBtn.Text = "WataX"
-bubbleBtn.BackgroundColor3 = Color3.fromRGB(0,140,220)
-bubbleBtn.TextColor3 = Color3.fromRGB(255,255,255)
-bubbleBtn.Font = Enum.Font.GothamBold
-bubbleBtn.TextScaled = true
-bubbleBtn.Visible = false
-bubbleBtn.Active = true
-bubbleBtn.Draggable = true
-Instance.new("UICorner", bubbleBtn).CornerRadius = UDim.new(0,14)
+local toggleBtn = Instance.new("TextButton", frame)
+toggleBtn.Size = UDim2.new(0.8,0,0.25,0)
+toggleBtn.Position = UDim2.new(0.1,0,0.35,0)
+toggleBtn.Text = "▶ Start"
+toggleBtn.TextScaled = true
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.BackgroundColor3 = Color3.fromRGB(70,200,120)
+toggleBtn.TextColor3 = Color3.fromRGB(255,255,255)
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0,14)
 
-miniBtn.MouseButton1Click:Connect(function()
-    frame.Visible = false
-    bubbleBtn.Visible = true
+local toggleGlow = Instance.new("UIStroke")
+toggleGlow.Parent = toggleBtn
+toggleGlow.Color = Color3.fromRGB(0,255,255)
+toggleGlow.Thickness = 2
+toggleGlow.Transparency = 0.5
+
+toggleBtn.MouseEnter:Connect(function()
+    TweenService:Create(toggleGlow, TweenInfo.new(0.2), {Transparency=0.1, Thickness=4}):Play()
 end)
-bubbleBtn.MouseButton1Click:Connect(function()
-    frame.Visible = true
-    bubbleBtn.Visible = false
+toggleBtn.MouseLeave:Connect(function()
+    TweenService:Create(toggleGlow, TweenInfo.new(0.2), {Transparency=0.5, Thickness=2}):Play()
 end)
 
-local discordBtn = Instance.new("TextButton", frame)
-discordBtn.Size = UDim2.new(0,100,0,30)
-discordBtn.AnchorPoint = Vector2.new(0,1)
-discordBtn.Position = UDim2.new(0,5,1,-5)
-discordBtn.Text = "Discord"
-discordBtn.BackgroundColor3 = Color3.fromRGB(90,90,220)
-discordBtn.TextColor3 = Color3.fromRGB(255,255,255)
-discordBtn.Font = Enum.Font.GothamBold
-discordBtn.TextScaled = true
-Instance.new("UICorner", discordBtn).CornerRadius = UDim.new(0,8)
-discordBtn.MouseButton1Click:Connect(function()
-    if setclipboard then
-        setclipboard("https://discord.gg/tfNqRQsqHK")
+local isRunning = false
+toggleBtn.MouseButton1Click:Connect(function()
+    if not isRunning then
+        isRunning = true
+        toggleBtn.Text = "■ Stop"
+        task.spawn(runRoute)
+    else
+        isRunning = false
+        toggleBtn.Text = "▶ Start"
+        stopRoute()
     end
 end)
 
-local speedRow = Instance.new("Frame", frame)
-speedRow.Size = UDim2.new(0,160,0,30)
-speedRow.AnchorPoint = Vector2.new(0,1)
-speedRow.Position = UDim2.new(0,110,1,-5)
-speedRow.BackgroundTransparency = 1
 
-local speedValue = Instance.new("TextLabel", speedRow)
-speedValue.Size = UDim2.new(0,60,1,0)
-speedValue.Position = UDim2.new(0,0,0,0)
-speedValue.BackgroundTransparency = 1
-speedValue.TextColor3 = Color3.fromRGB(220,220,220)
-speedValue.Font = Enum.Font.GothamBold
-speedValue.TextScaled = true
-speedValue.Text = string.format("%.2fx", playbackRate)
+local speedLabel = Instance.new("TextLabel", frame)
+speedLabel.Size = UDim2.new(0.35,0,0.2,0)
+speedLabel.Position = UDim2.new(0.325,0,0.7,0)
+speedLabel.BackgroundTransparency = 1
+speedLabel.TextColor3 = Color3.fromRGB(180,180,255)
+speedLabel.Font = Enum.Font.GothamBold
+speedLabel.TextScaled = true
+speedLabel.Text = playbackRate.."x"
 
-local speedDown = Instance.new("TextButton", speedRow)
-speedDown.Size = UDim2.new(0,40,1,0)
-speedDown.Position = UDim2.new(0,65,0,0)
-speedDown.Text = "–"
-speedDown.BackgroundColor3 = Color3.fromRGB(60,60,100)
+local speedDown = Instance.new("TextButton", frame)
+speedDown.Size = UDim2.new(0.2,0,0.2,0)
+speedDown.Position = UDim2.new(0.05,0,0.7,0)
+speedDown.Text = "-"
+speedDown.Font = Enum.Font.GothamBold
+speedDown.TextScaled = true
+speedDown.BackgroundColor3 = Color3.fromRGB(100,100,100)
 speedDown.TextColor3 = Color3.fromRGB(255,255,255)
-Instance.new("UICorner", speedDown).CornerRadius = UDim.new(0,8)
-
-local speedUp = Instance.new("TextButton", speedRow)
-speedUp.Size = UDim2.new(0,40,1,0)
-speedUp.Position = UDim2.new(0,110,0,0)
-speedUp.Text = "+"
-speedUp.BackgroundColor3 = Color3.fromRGB(60,60,100)
-speedUp.TextColor3 = Color3.fromRGB(255,255,255)
-Instance.new("UICorner", speedUp).CornerRadius = UDim.new(0,8)
-
+Instance.new("UICorner", speedDown).CornerRadius = UDim.new(0,6)
 speedDown.MouseButton1Click:Connect(function()
-    playbackRate = math.max(0.25, playbackRate - 0.25)
-    speedValue.Text = string.format("%.2fx", playbackRate)
-end)
-speedUp.MouseButton1Click:Connect(function()
-    playbackRate = math.min(3, playbackRate + 0.25)
-    speedValue.Text = string.format("%.2fx", playbackRate)
+    playbackRate = math.max(0.25, playbackRate-0.25)
+    speedLabel.Text = playbackRate.."x"
 end)
 
-_G.WataX_Replay = false
+local speedUp = Instance.new("TextButton", frame)
+speedUp.Size = UDim2.new(0.2,0,0.2,0)
+speedUp.Position = UDim2.new(0.75,0,0.7,0)
+speedUp.Text = "+"
+speedUp.Font = Enum.Font.GothamBold
+speedUp.TextScaled = true
+speedUp.BackgroundColor3 = Color3.fromRGB(100,100,150)
+speedUp.TextColor3 = Color3.fromRGB(255,255,255)
+Instance.new("UICorner", speedUp).CornerRadius = UDim.new(0,6)
+speedUp.MouseButton1Click:Connect(function()
+    playbackRate = math.min(3, playbackRate+0.25)
+    speedLabel.Text = playbackRate.."x"
+end)
