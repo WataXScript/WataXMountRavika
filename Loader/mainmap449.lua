@@ -41,33 +41,77 @@ if player.Character then refreshHRP(player.Character) end
 
 
 local function setupMovement(char)
-    local humanoid = char:WaitForChild("Humanoid")
-    local lastPos = char.HumanoidRootPart.Position
-    local jumpCooldown = false
-    if animConn then animConn:Disconnect() end
-    animConn = RunService.RenderStepped:Connect(function()
-        if not isMoving then return end
-        if not hrp or not hrp.Parent then return end
-
-        local direction = hrp.Position - lastPos
-        local dist = direction.Magnitude
-        if dist > 0.01 then
-            humanoid:Move(direction.Unit * math.clamp(dist*5,0,1), false)
-        else
-            humanoid:Move(Vector3.zero,false)
+    task.spawn(function()
+        if not char then
+            char = player.Character or player.CharacterAdded:Wait()
         end
+        local humanoid = char:WaitForChild("Humanoid", 5)
+        local root = char:WaitForChild("HumanoidRootPart", 5)
+        if not humanoid or not root then return end
 
-        local deltaY = hrp.Position.Y - lastPos.Y
-        if deltaY > 0.9 and not jumpCooldown then
-            humanoid.Jump = true
-            jumpCooldown = true
-            task.delay(0.4,function() jumpCooldown=false end)
-        end
-        lastPos = hrp.Position
+        -- ✅ Tambahan stop kalau mati + update tombol UI
+        humanoid.Died:Connect(function()
+            print("[WataX] Karakter mati, replay otomatis berhenti.")
+            isReplayRunning = false
+            stopMovement()
+            isRunning = false
+            if toggleBtn and toggleBtn.Parent then
+                toggleBtn.Text = "▶ Start"
+                toggleBtn.BackgroundColor3 = Color3.fromRGB(70,200,120)
+            end
+        end)
+
+        if animConn then animConn:Disconnect() end
+        local lastPos = root.Position
+        local jumpCooldown = false
+
+        animConn = RunService.RenderStepped:Connect(function()
+            if not isMoving then return end
+
+            -- otomatis perbarui HRP jika ganti karakter / respawn
+            if not hrp or not hrp.Parent or not hrp:IsDescendantOf(workspace) then
+                if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                    hrp = player.Character:FindFirstChild("HumanoidRootPart")
+                    root = hrp
+                else
+                    return -- skip frame kalau belum siap
+                end
+            end
+
+            if not humanoid or humanoid.Health <= 0 then return end
+
+            local direction = root.Position - lastPos
+            local dist = direction.Magnitude
+
+            if dist > 0.01 then
+                humanoid:Move(direction.Unit * math.clamp(dist * 5, 0, 1), false)
+            else
+                humanoid:Move(Vector3.zero, false)
+            end
+
+            local deltaY = root.Position.Y - lastPos.Y
+            if deltaY > 0.9 and not jumpCooldown then
+                humanoid.Jump = true
+                jumpCooldown = true
+                task.delay(0.4, function()
+                    jumpCooldown = false
+                end)
+            end
+
+            lastPos = root.Position
+        end)
     end)
 end
-player.CharacterAdded:Connect(setupMovement)
-if player.Character then setupMovement(player.Character) end
+
+player.CharacterAdded:Connect(function(char)
+    refreshHRP(char)
+    setupMovement(char)
+end)
+
+if player.Character then
+    refreshHRP(player.Character)
+    setupMovement(player.Character)
+end
 
 local function startMovement() isMoving=true end
 local function stopMovement() isMoving=false end
